@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 from .encrypt import AES_Encrypt, enc, generate_captcha_key, verify_param
 import json
+import os
 import requests
 import re
 import time
 import logging
 import datetime
 from urllib3.exceptions import InsecureRequestWarning
+
+# 登录 cookie 持久化文件（避免频繁登录触发风控）
+COOKIE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.json")
 
 
 def get_date(day_offset: int = 0):
@@ -99,10 +103,80 @@ class reserve:
             
         return matches[0] if matches else "", value_matches[0] if value_matches else ""
 
+    def _load_cookies(self):
+        """从文件加载已保存的登录 cookie"""
+        if not os.path.exists(COOKIE_FILE):
+            return False
+        try:
+            with open(COOKIE_FILE, encoding="utf-8") as f:
+                cookies = json.load(f)
+            for c in cookies:
+                self.requests.cookies.set(
+                    c["name"], c["value"], domain=c.get("domain", "")
+                )
+            logging.info(f"已从 {COOKIE_FILE} 加载 {len(cookies)} 个 cookie")
+            return True
+        except Exception as e:
+            logging.warning(f"加载 cookie 失败: {str(e)[:80]}")
+            return False
+
+    def _save_cookies(self):
+        """保存当前会话 cookie 到文件"""
+        try:
+            cookies = [
+                {"name": c.name, "value": c.value, "domain": c.domain}
+                for c in self.requests.cookies
+            ]
+            with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cookies, f, ensure_ascii=False, indent=2)
+            logging.info(f"已保存 {len(cookies)} 个 cookie 到 {COOKIE_FILE}")
+        except Exception as e:
+            logging.warning(f"保存 cookie 失败: {str(e)[:80]}")
+
+    def _check_login(self):
+        """检查当前会话是否已登录（访问 reserve/info 接口，未登录会跳转/报错）"""
+        try:
+            # 从 config 读取 roomid/seatNum 用于检查登录态
+            try:
+                cfg = json.load(open(os.path.join(os.path.dirname(COOKIE_FILE), "config.json"), encoding="utf-8"))
+                u = cfg["reserve"][0]
+                roomid = u["roomid"]
+                seatid = u["seatid"][0] if isinstance(u["seatid"], list) else u["seatid"]
+                seat_num = int(seatid)
+            except Exception:
+                roomid, seat_num = "14176", 27
+            url = f"https://office.chaoxing.com/data/apps/seat/reserve/info?id={roomid}&seatNum={seat_num}"
+            r = self.requests.get(url=url, verify=False, timeout=10, allow_redirects=False)
+            if r.status_code != 200:
+                return False
+            data = r.json()
+            if data.get("success") is False:
+                return False
+            if data.get("msg") and ("登录" in str(data["msg"]) or "未登录" in str(data["msg"])):
+                return False
+            return True
+        except Exception as e:
+            logging.warning(f"登录态检查异常: {str(e)[:60]}")
+            return False
+
     def get_login_status(self):
-        """获取登录状态（初始化会话）"""
-        self.requests.headers = self.login_headers
+        """获取登录状态：优先复用已保存 cookie，有效则无需重新登录"""
+        init_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Referer": "https://office.chaoxing.com/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        self.requests.headers.update(init_headers)
         self.requests.get(url=self.login_page, verify=False)
+
+        # 优先复用已保存的 cookie
+        if self._load_cookies():
+            if self._check_login():
+                logging.info("✓ 使用已保存的登录 cookie（无需重新登录）")
+                return True
+            logging.info("已保存 cookie 已失效，需要重新登录")
+        return False
 
     def login(self, username, password):
         username = AES_Encrypt(username)
@@ -111,13 +185,26 @@ class reserve:
             "fid": -1,
             "uname": username,
             "password": password,
-            "refer": "http%3A%2F%2Foffice.chaoxing.com%2Ffront%2Fthird%2Fapps%2Fseat%2Fcode%3Fid%3D4219%26seatNum%3D380",
+            "refer": "https://office.chaoxing.com/",
             "t": True,
         }
+        # 登录请求使用桌面UA和正确的Referer/Origin
+        login_req_headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Referer": "https://office.chaoxing.com/",
+            "Origin": "https://office.chaoxing.com",
+        }
+        self.requests.headers.update(login_req_headers)
         jsons = self.requests.post(url=self.login_url, params=parm, verify=False)
         obj = jsons.json()
         if obj["status"]:
             logging.info(f"用户 {username} 登录成功")
+            # 登录成功后持久化 cookie，避免频繁登录触发风控
+            self._save_cookies()
             return (True, "")
         else:
             logging.info(
@@ -379,8 +466,28 @@ class reserve:
             })
         else:
             logging.info("✗ 预约失败")
+            self.last_error = result.get("msg", "未知原因")
 
         return result["success"]
+
+    def get_cur_reserve(self, roomid, seatid, fid_enc):
+        """获取当前生效的预约记录（含未来时段）：从座位首页数据接口的 curReserves 中按座位匹配
+        返回 dict 或 None。reserve/info 接口对未来时段预约返回 None，不可用。"""
+        try:
+            url = f"https://office.chaoxing.com/data/apps/seat/index?fidEnc={fid_enc}"
+            r = self.requests.get(url=url, verify=False, timeout=15)
+            data = r.json()
+            cur_list = data.get("data", {}).get("curReserves", [])
+            seat_num = str(int(seatid))  # 027 → 27
+            for c in cur_list:
+                c_seat = str(int(str(c.get("seatNum"))))  # 027 → 27（去前导零）
+                c_room = str(c.get("roomId"))
+                if c_seat == seat_num and c_room == str(roomid):
+                    return c
+            return None
+        except Exception as e:
+            logging.error(f"获取当前预约失败: {str(e)[:100]}")
+            return None
 
     def sign(self, reserve_id):
         """签到：调用签到接口（模拟扫码签到，预约前后20分钟内有效）"""
@@ -450,6 +557,7 @@ class reserve:
                 return seat_info['id']
             else:
                 logging.info(f"✗ 续约失败: {result.get('msg', '')}")
+                self.last_error = result.get("msg", "续约失败")
                 return None
         except Exception as e:
             logging.error(f"✗ 续约异常: {str(e)[:100]}")
@@ -468,17 +576,11 @@ class reserve:
             return
 
         # 构建推送内容
-        body_lines = []
-        for idx, result in enumerate(self.success_results, 1):
-            body_lines.append(
-                f"预约 {idx}：\n"
-                f"房间 {result['roomId']}｜座位 {result['seatNum']}\n"
-                f"{result['day']} {result['startTime']}~{result['endTime']}"
-            )
+        body_lines = [f"座位{r['seatNum']} {r['startTime']}-{r['endTime']}" for r in self.success_results]
         payload = {
-            "title": f"超星图书馆预约成功（共{len(self.success_results)}条）",
-            "body": "\n\n".join(body_lines),
-            "group": "超星抢座",
+            "title": "抢座成功",
+            "body": "\n".join(body_lines),
+            "group": "超星座位",
         }
 
         # 用独立请求发送，避免复用带 office.chaoxing.com Host 头的会话

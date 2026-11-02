@@ -9,6 +9,7 @@ import argparse
 import os
 import logging
 import datetime
+import requests
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,7 +43,10 @@ def login_and_reserve(users, usernames, passwords, action, success_list=None):
     reserve_instances = []  # 保存所有的 reserve 实例
 
     for index, user in enumerate(users):
-        username, password, times, roomid, seatid, daysofweek = user.values()
+        username, password, times, roomid, seatid, daysofweek = (
+            user['username'], user['password'], user['time'],
+            user['roomid'], user['seatid'], user.get('daysofweek', [])
+        )
         
         # 检查今天是否需要预约
         if current_dayofweek not in daysofweek and daysofweek:
@@ -60,8 +64,8 @@ def login_and_reserve(users, usernames, passwords, action, success_list=None):
         
         # 创建预约实例并预约
         s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY)
-        s.get_login_status()
-        s.login(username, password)
+        if not s.get_login_status():
+            s.login(username, password)
         s.requests.headers.update({'Host': 'office.chaoxing.com'})
         suc = s.submit(times, roomid, seatid, action)
         success_list[index] = suc
@@ -143,7 +147,10 @@ def debug(users, action=False):
     current_dayofweek = get_current_dayofweek(action)
     
     for index, user in enumerate(users):
-        username, password, times, roomid, seatid, daysofweek = user.values()
+        username, password, times, roomid, seatid, daysofweek = (
+            user['username'], user['password'], user['time'],
+            user['roomid'], user['seatid'], user.get('daysofweek', [])
+        )
         
         # 座位ID转为列表（若为字符串）
         if isinstance(seatid, str):
@@ -161,8 +168,8 @@ def debug(users, action=False):
         
         # 执行预约
         s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY)
-        s.get_login_status()
-        s.login(username, password)
+        if not s.get_login_status():
+            s.login(username, password)
         s.requests.headers.update({'Host': 'office.chaoxing.com'})
         suc = s.submit(times, roomid, seatid, action)
         
@@ -184,17 +191,20 @@ def wait_until(target_hms):
     time.sleep(wait_s)
 
 
-def main_with_renewal(users, action=False):
-    """持续运行模式：预约第一段 → 等待第一段开始时间签到(仅一次) → 连续续约到结束时段"""
+def reserve_first(users, action=False):
+    """抢座模式：只预约第一段（配合分段定时任务，签到/续约由独立脚本完成）"""
     current_time = get_current_time(action)
     current_dayofweek = get_current_dayofweek(action)
-    logging.info(f"持续运行模式(签到续约)启动 {current_time} ({current_dayofweek})")
+    logging.info(f"抢座模式(仅第一段)启动 {current_time} ({current_dayofweek})")
 
     if action:
         usernames, passwords = get_user_credentials(action)
 
     for index, user in enumerate(users):
-        username, password, times, roomid, seatid, daysofweek = user.values()
+        username, password, times, roomid, seatid, daysofweek = (
+            user['username'], user['password'], user['time'],
+            user['roomid'], user['seatid'], user.get('daysofweek', [])
+        )
 
         if daysofweek and current_dayofweek not in daysofweek:
             logging.info("今天没有预订!")
@@ -209,8 +219,74 @@ def main_with_renewal(users, action=False):
 
         s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT,
                     enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY)
-        s.get_login_status()
-        s.login(username, password)
+        if not s.get_login_status():
+            ok, msg = s.login(username, password)
+            if not ok:
+                logging.error(f"登录失败: {msg}")
+                continue
+        s.requests.headers.update({'Host': 'office.chaoxing.com'})
+
+        segments = s._split_times(times[0], times[1])
+        first_start, first_end = segments[0]
+        logging.info(f"=== 预约第一段: {first_start}-{first_end} ===")
+
+        token, value = s._get_page_token(s.url.format(roomid, seat), require_value=True)
+        suc = s.get_submit(
+            s.submit_url, times=[first_start, first_end],
+            token=token, roomid=roomid, seatid=seat,
+            captcha="", action=action, value=value,
+        )
+        if suc and s.success_results:
+            s.send_bark_notification()
+        elif not suc:
+            # 抢座失败也要通知（带原因）
+            err = getattr(s, 'last_error', '未知原因')
+            logging.error(f"第一段预约失败: {err}")
+            key = s.bark.get("key", "")
+            server = s.bark.get("server", "https://api.day.app").rstrip("/")
+            if key:
+                try:
+                    requests.post(f"{server}/{key}", json={
+                        "title": "抢座失败",
+                        "body": f"座位{seat} {first_start}-{first_end}：{err}",
+                        "group": "超星座位",
+                    }, timeout=10)
+                    logging.info("✓ Bark 推送失败通知")
+                except Exception as e:
+                    logging.error(f"✗ Bark 推送失败: {str(e)}")
+        return suc
+
+
+def main_with_renewal(users, action=False):
+    """持续运行模式：预约第一段 → 等待第一段开始时间签到(仅一次) → 连续续约到结束时段"""
+    current_time = get_current_time(action)
+    current_dayofweek = get_current_dayofweek(action)
+    logging.info(f"持续运行模式(签到续约)启动 {current_time} ({current_dayofweek})")
+
+    if action:
+        usernames, passwords = get_user_credentials(action)
+
+    for index, user in enumerate(users):
+        username, password, times, roomid, seatid, daysofweek = (
+            user['username'], user['password'], user['time'],
+            user['roomid'], user['seatid'], user.get('daysofweek', [])
+        )
+
+        if daysofweek and current_dayofweek not in daysofweek:
+            logging.info("今天没有预订!")
+            continue
+
+        if action:
+            username, password = usernames.split(',')[index], passwords.split(',')[index]
+
+        if isinstance(seatid, str):
+            seatid = [seatid]
+        seat = seatid[0]
+
+        s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT,
+                    enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY)
+        if not s.get_login_status():
+            s.login(username, password)
         s.requests.headers.update({'Host': 'office.chaoxing.com'})
 
         # 切分时段（单次上限4小时，最短2小时，30分钟对齐）
@@ -266,8 +342,8 @@ def get_roomid(args1, args2):
     password = input("请输入密码: ")
     
     s = reserve(sleep_time=SLEEPTIME, max_attempt=MAX_ATTEMPT, enable_slider=ENABLE_SLIDER, reserve_next_day=RESERVE_NEXT_DAY)
-    s.get_login_status()
-    s.login(username=username, password=password)
+    if not s.get_login_status():
+        s.login(username=username, password=password)
     s.requests.headers.update({'Host': 'office.chaoxing.com'})
     
     deptid_enc = input("请输入deptIdEnc: ")
@@ -279,12 +355,12 @@ if __name__ == "__main__":
     config_path = os.path.join(os.path.dirname(__file__), 'config.json')
     parser = argparse.ArgumentParser(prog='Chao Xing seat auto reserve')
     parser.add_argument('-u', '--user', default=config_path, help='user config file')
-    parser.add_argument('-m', '--method', default="reserve", choices=["reserve", "debug", "room", "renewal"], help='execution method: reserve=抢座循环, debug=单次测试, renewal=预约+签到续约持续运行')
+    parser.add_argument('-m', '--method', default="reserve", choices=["reserve", "debug", "room", "renewal", "first"], help='execution method: reserve=抢座循环, debug=单次测试, first=只预约第一段, renewal=预约+签到续约持续运行')
     parser.add_argument('-a', '--action', action="store_true", help='enable GitHub Action mode')
     args = parser.parse_args()
     
     # 执行对应的方法
-    func_dict = {"reserve": main, "debug": debug, "room": get_roomid, "renewal": main_with_renewal}
+    func_dict = {"reserve": main, "debug": debug, "room": get_roomid, "renewal": main_with_renewal, "first": reserve_first}
     with open(args.user, "r+", encoding="utf-8") as data:
         usersdata = json.load(data)["reserve"]
     func_dict[args.method](usersdata, args.action)
